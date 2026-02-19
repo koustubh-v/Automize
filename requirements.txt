@@ -4,3 +4,4 @@ python-multipart
 requests
 redis
 python-json-logger
+python-dotenv

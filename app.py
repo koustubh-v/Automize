@@ -1,5 +1,8 @@
 import os
 import uuid
+from dotenv import load_dotenv
+
+load_dotenv()
 import subprocess
 import requests
 import time
@@ -15,6 +18,7 @@ import redis
 from pythonjsonlogger.json import JsonFormatter
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Header
+from fastapi.middleware.cors import CORSMiddleware
 
 INTERNAL_SERVICE_KEY = os.getenv("INTERNAL_SERVICE_KEY")
 LMS_STORE_URL = os.getenv("LMS_STORE_URL")
@@ -53,6 +57,15 @@ def log_event(event: str, level: str = "info", **kwargs):
 
 
 app = FastAPI()
+
+# Add CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 VIDEO_DIR = "temp_videos"
 os.makedirs(VIDEO_DIR, exist_ok=True)

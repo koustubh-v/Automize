@@ -137,3 +137,6 @@ dmypy.json
 # Custom
 temp_videos/
 .DS_Store
+DEPLOYMENT.md
+LMS_INTEGRATION_GUIDE.md
+LOCAL_TESTING.md
