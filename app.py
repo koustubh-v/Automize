@@ -8,6 +8,7 @@ import threading
 import shutil
 import json
 import socket
+import hashlib
 from typing import Optional, Dict, Any
 
 import redis
@@ -56,9 +57,9 @@ app = FastAPI()
 VIDEO_DIR = "temp_videos"
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-MAX_VIDEO_SIZE_MB = 2000 
+MAX_VIDEO_SIZE_MB = 2000
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-REDIS_TTL = 7200 
+REDIS_TTL = 7200
 
 class JobManager:
     def __init__(self, redis_url: Optional[str]):
@@ -115,16 +116,6 @@ class JobManager:
 
         self.set_job(video_id, job)
 
-    def delete_job(self, video_id: str):
-        if self.use_redis:
-            try:
-                self.redis_client.delete(f"job:{video_id}")
-            except Exception:
-                pass
-        else:
-            with self.memory_lock:
-                self.memory_store.pop(video_id, None)
-
 
 job_manager = JobManager(REDIS_URL)
 
@@ -142,6 +133,14 @@ def cleanup_orphan_files():
                     log_event("orphan_file_deleted", file=filename)
                 except Exception:
                     pass
+
+
+def calculate_file_hash(path: str) -> str:
+    sha256_hash = hashlib.sha256()
+    with open(path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
 
 def compress_video_ffmpeg(input_path, output_path):
@@ -199,23 +198,43 @@ def send_to_lms(video_id, organization_id, compressed_path):
     return False
 
 
-def background_process_video(video_id, organization_id, input_path, output_path):
+def background_process_video(video_id, organization_id, input_path, file_hash, input_ext):
+    compressed_filename = f"{file_hash}_compressed.mp4"
+    output_path = os.path.join(VIDEO_DIR, compressed_filename)
+    
+    # We rename input_path to be hash-based if it's not already
+    hashed_input_path = os.path.join(VIDEO_DIR, f"{file_hash}_raw{input_ext}")
+    
+    if os.path.exists(input_path) and input_path != hashed_input_path:
+        # If hash collision (rare) or just renaming, overwrite
+        shutil.move(input_path, hashed_input_path)
+    
+    # Use the hashed path from now on
+    input_path = hashed_input_path
+
     try:
         job_manager.update_status(video_id, "processing")
-        log_event("processing_started", video_id=video_id)
+        log_event("processing_started", video_id=video_id, hash=file_hash)
 
-        start = time.time()
-        try:
-            compress_video_ffmpeg(input_path, output_path)
-        except Exception as e:
-             log_event("ffmpeg_error", level="error", video_id=video_id, error=str(e))
-             job_manager.update_status(video_id, "failed", {"error": "Compression failed"})
-             if os.path.exists(input_path): os.remove(input_path)
-             return
+        # 1. Check Deduplication
+        if os.path.exists(output_path):
+            log_event("deduplication_hit", video_id=video_id, hash=file_hash)
+            # Skip compression
+        else:
+            # Compress
+            start = time.time()
+            try:
+                compress_video_ffmpeg(input_path, output_path)
+            except Exception as e:
+                 log_event("ffmpeg_error", level="error", video_id=video_id, error=str(e))
+                 job_manager.update_status(video_id, "failed", {"error": "Compression failed"})
+                 # On compression failure, we might as well keep input for retry? 
+                 # Or assumption is ffmpeg will fail again. Let's keep input for manual inspection/retry.
+                 return
+            duration = time.time() - start
+            log_event("compression_completed", video_id=video_id, duration=duration)
 
-        duration = time.time() - start
-        log_event("compression_completed", video_id=video_id, duration=duration)
-
+        # 2. Send to LMS
         job_manager.update_status(video_id, "uploading_to_lms")
         success = send_to_lms(video_id, organization_id, output_path)
 
@@ -223,6 +242,7 @@ def background_process_video(video_id, organization_id, input_path, output_path)
             job_manager.update_status(video_id, "completed")
             log_event("job_completed_successfully", video_id=video_id)
             
+            # 3. Cleanup Cleanly (ONLY ON SUCCESS)
             if os.path.exists(input_path): 
                 os.remove(input_path)
                 log_event("cleanup_input_file", video_id=video_id)
@@ -233,12 +253,12 @@ def background_process_video(video_id, organization_id, input_path, output_path)
                 
         else:
             job_manager.update_status(video_id, "failed_upload_to_lms")
-            if os.path.exists(input_path): os.remove(input_path)
+            log_event("retalining_files_for_retry", video_id=video_id)
+            # FILES ARE KEPT ON DISK
 
     except Exception as e:
         log_event("processing_unexpected_error", level="error", video_id=video_id, error=str(e))
         job_manager.update_status(video_id, "failed", {"error": str(e)})
-        if os.path.exists(input_path): os.remove(input_path)
 
 
 @app.get("/health")
@@ -267,11 +287,10 @@ async def receive_video(
     if ext not in ALLOWED_VIDEO_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported format. Allowed: {ALLOWED_VIDEO_EXTENSIONS}")
 
-    input_filename = f"{video_id}_raw{ext}"
-    output_filename = f"{video_id}_compressed.mp4"
-
+    # Temporary UUID name for ingestion
+    temp_id = str(uuid.uuid4())
+    input_filename = f"{temp_id}_ingest{ext}"
     input_path = os.path.join(VIDEO_DIR, input_filename)
-    output_path = os.path.join(VIDEO_DIR, output_filename)
 
     try:
         with open(input_path, "wb") as buffer:
@@ -285,12 +304,17 @@ async def receive_video(
         os.remove(input_path)
         raise HTTPException(status_code=400, detail=f"File too large. Limit: {MAX_VIDEO_SIZE_MB}MB")
 
+    # Calculate Hash for Identification
+    file_hash = calculate_file_hash(input_path)
+    
+    log_event("video_received", video_id=video_id, hash=file_hash)
+
     job_data = {
         "status": "queued",
         "created_at": time.time(),
         "video_id": video_id,
         "org_id": organization_id,
-        "input_path": input_path
+        "file_hash": file_hash
     }
 
     job_manager.set_job(video_id, job_data)
@@ -300,10 +324,9 @@ async def receive_video(
         video_id,
         organization_id,
         input_path,
-        output_path
+        file_hash,
+        ext
     )
-
-    log_event("video_received", video_id=video_id, size_mb=file_size_mb)
     
     return {
         "status": "queued", 

@@ -3,5 +3,4 @@ uvicorn
 python-multipart
 requests
 redis
-pythr
-requests
+python-json-logger

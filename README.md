@@ -10,6 +10,15 @@ A Python FastAPI microservice designed to handle video uploads, compress them us
 - **Auto-Cleanup**: Deletes input and output videos after successful processing to save costs.
 - **Scalable**: Stateless design (with optional Redis support) suitable for serverless deployment.
 
+## Smart Retry & Persistence
+
+This service is optimized for ephemeral environments like Google Cloud Run.
+
+1.  **Duplicate Detection**: Files are hashed (SHA256) upon upload. If a compressed version of the file already exists on the server's temporary disk, compression is skipped, and the existing file is sent immediately.
+2.  **Conditional Cleanup**:
+    -   **Success**: If the LMS accepts the video (HTTP 200), local files are **deleted** to free up space.
+    -   **Failure**: If the LMS fails to accept the video, local files are **kept**. This allows for an instant "Smart Retry" if the user uploads the same file again within the server's lifespan (~15 minutes).
+
 ## Prerequisites
 
 - **Google Cloud Platform Account**
